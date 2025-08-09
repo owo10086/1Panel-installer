@@ -1,15 +1,20 @@
+name: Checkout and Create Release Version
+
 on:
   push:
     branches: [ master ]
   schedule:
-    - cron: '0 2 * * *'
+    - cron: '0 2 * * *'   # GitHub Actions 使用 UTC
   workflow_dispatch:
 
-name: Checkout and Create Release Version
+# 允许本工作流创建/更新 Release 资产
+permissions:
+  contents: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -19,7 +24,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # 用官方仓库拿版本，避免 fork 无资产
+          set -euo pipefail
+          # 用官方仓库拿 1Panel 最新版本，避免 fork 没有资产
           version=$(curl -sH "Authorization: Bearer ${GITHUB_TOKEN}" \
             https://api.github.com/repos/1Panel-dev/1Panel/releases/latest | jq -r '.tag_name')
 
@@ -34,11 +40,12 @@ jobs:
             exit 1
           fi
 
+          # 输出供后续步骤使用
           echo "version=${version}" >> $GITHUB_OUTPUT
           echo "app_version=${version}" >> $GITHUB_OUTPUT
-          # docker 去掉前缀 v
-          echo "docker_version=${docker_version#v}" >> $GITHUB_OUTPUT
+          echo "docker_version=${docker_version#v}" >> $GITHUB_OUTPUT   # 去掉前缀 v
           echo "compose_version=${compose_version}" >> $GITHUB_OUTPUT
+
           echo "Current app_version: $version, docker_version: ${docker_version#v}, compose_version: $compose_version"
 
       - name: Check Release
@@ -46,6 +53,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # 不存在则标记需要创建
           gh release view ${{ steps.get-version.outputs.version }} -R ${{ github.repository }} >/dev/null 2>&1 || echo "create=1" >> $GITHUB_OUTPUT
 
       - name: Check Build
@@ -53,10 +61,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # 用 JSON 精确查资产是否存在（至少检查一个离线包）
-          has_asset=$(gh release view ${{ steps.get-version.outputs.version }} -R ${{ github.repository }} \
-            --json assets --jq '.assets[].name | select(test("1panel-.*-offline-linux-amd64\\.tar\\.gz"))' || true)
-          if [ -z "$has_asset" ]; then
+          # 用 JSON 精确检查是否已有离线资产（任意架构都行，至少有一个才算已构建）
+          has_any_offline=$(gh release view ${{ steps.get-version.outputs.version }} -R ${{ github.repository }} \
+            --json assets --jq '.assets[].name | select(test("^1panel-.*-offline-linux-.*\\.tar\\.gz$"))' || true)
+
+          if [ -z "$has_any_offline" ]; then
             echo "build=1" >> $GITHUB_OUTPUT
           fi
 
@@ -64,10 +73,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -e
           sed -i "s@VERSION=v.*@VERSION=${{ steps.get-version.outputs.version }}@" install.sh
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add .
+          git add -A
           git commit -m "Release ${{ steps.get-version.outputs.version }}" || true
           git tag -a "${{ steps.get-version.outputs.version }}" -m "Release ${{ steps.get-version.outputs.version }}" || true
           git push origin "${{ steps.get-version.outputs.version }}" || true
@@ -82,35 +92,41 @@ jobs:
       - name: Make Offline
         if: steps.check-build.outputs.build == 1
         env:
-          # 让 prepare.sh 从官方仓库拉资产，避免 404
+          # 让 prepare.sh 从官方仓库拉 release 资产；只构建 aarch64/x86_64（需要更多就改这里）
           APP_REPO: 1Panel-dev/1Panel
+          ARCH_LIST: "aarch64 x86_64"
         run: |
+          set -e
           chmod +x prepare.sh
-          sudo APP_REPO="$APP_REPO" ./prepare.sh \
+          sudo APP_REPO="$APP_REPO" ARCH_LIST="$ARCH_LIST" ./prepare.sh \
             --app_version "${{ steps.get-version.outputs.app_version }}" \
             --docker_version "${{ steps.get-version.outputs.docker_version }}" \
             --compose_version "${{ steps.get-version.outputs.compose_version }}"
 
-      - name: Upgrade Release
+      - name: Upload Assets
         if: steps.check-build.outputs.build == 1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # 修正上传路径：与 prepare.sh 实际输出对齐（常见为 build/*.tar.gz）
+          set -e
           shopt -s nullglob
-          files=(build/*.tar.gz)
+          # 先尝试标准目录 build/<version>/，否则退回到 build/
+          files=(build/${{ steps.get-version.outputs.version }}/*.tar.gz)
           if [ ${#files[@]} -eq 0 ]; then
-            echo "No tar.gz under build/. Try fallback path build/${{ steps.get-version.outputs.version }}/"
-            files=(build/${{ steps.get-version.outputs.version }}/*.tar.gz)
+            files=(build/*.tar.gz)
           fi
-          echo "Uploading files: ${files[*]}"
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No .tar.gz files found to upload." >&2
+            exit 1
+          fi
+          echo "Uploading: ${files[*]}"
           gh release upload ${{ steps.get-version.outputs.version }} "${files[@]}" -R ${{ github.repository }} --clobber
 
           # checksums 也做双路径兜底
-          if [ -f "build/checksums.txt" ]; then
-            gh release upload ${{ steps.get-version.outputs.version }} build/checksums.txt -R ${{ github.repository }} --clobber
-          elif [ -f "build/${{ steps.get-version.outputs.version }}/checksums.txt" ]; then
-            gh release upload ${{ steps.get-version.outputs.version }} build/${{ steps.get-version.outputs.version }}/checksums.txt -R ${{ github.repository }} --clobber
+          if [ -f "build/${{ steps.get-version.outputs.version }}/checksums.txt" ]; then
+            gh release upload ${{ steps.get-version.outputs.version }} "build/${{ steps.get-version.outputs.version }}/checksums.txt" -R ${{ github.repository }} --clobber
+          elif [ -f "build/checksums.txt" ]; then
+            gh release upload ${{ steps.get-version.outputs.version }} "build/checksums.txt" -R ${{ github.repository }} --clobber
           else
             echo "checksums.txt not found, skip."
           fi

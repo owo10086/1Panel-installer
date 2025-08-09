@@ -1,7 +1,6 @@
 on:
   push:
-    branches:
-      - master
+    branches: [ master ]
   schedule:
     - cron: '0 2 * * *'
   workflow_dispatch:
@@ -17,63 +16,101 @@ jobs:
 
       - name: Check Version
         id: get-version
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          version=$(curl -s 'https://api.github.com/repos/wojiushixiaobai/1Panel/releases/latest' | jq -r ".tag_name")
-          docker_version=$(curl -s 'https://api.github.com/repos/moby/moby/releases/latest' | jq -r ".tag_name")
-          compose_version=$(curl -s 'https://api.github.com/repos/docker/compose/releases/latest' | jq -r ".tag_name")
-          if [ -z "${version}" ] || [ "${version}" == "null" ]; then
+          # 用官方仓库拿版本，避免 fork 无资产
+          version=$(curl -sH "Authorization: Bearer ${GITHUB_TOKEN}" \
+            https://api.github.com/repos/1Panel-dev/1Panel/releases/latest | jq -r '.tag_name')
+
+          docker_version=$(curl -sH "Authorization: Bearer ${GITHUB_TOKEN}" \
+            https://api.github.com/repos/moby/moby/releases/latest | jq -r '.tag_name')
+
+          compose_version=$(curl -sH "Authorization: Bearer ${GITHUB_TOKEN}" \
+            https://api.github.com/repos/docker/compose/releases/latest | jq -r '.tag_name')
+
+          if [ -z "${version}" ] || [ "${version}" = "null" ]; then
             echo "Failed to get version"
             exit 1
           fi
+
           echo "version=${version}" >> $GITHUB_OUTPUT
           echo "app_version=${version}" >> $GITHUB_OUTPUT
-          echo "docker_version=${docker_version/v/}" >> $GITHUB_OUTPUT
+          # docker 去掉前缀 v
+          echo "docker_version=${docker_version#v}" >> $GITHUB_OUTPUT
           echo "compose_version=${compose_version}" >> $GITHUB_OUTPUT
-          echo "Current app_version: $version, docker_version: $docker_version, compose_version: $compose_version"
+          echo "Current app_version: $version, docker_version: ${docker_version#v}, compose_version: $compose_version"
 
       - name: Check Release
         id: check-release
-        run: |
-          gh release view ${{ steps.get-version.outputs.version }} -R ${{ github.repository }} >/dev/null 2>&1 || echo "create=1" >> $GITHUB_OUTPUT
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view ${{ steps.get-version.outputs.version }} -R ${{ github.repository }} >/dev/null 2>&1 || echo "create=1" >> $GITHUB_OUTPUT
 
       - name: Check Build
         id: check-build
-        run: |
-          gh release view ${{ steps.get-version.outputs.version }} -R ${{ github.repository }} | grep 1panel-.*-offline-linux-amd64.tar.gz >/dev/null 2>&1 || echo "build=1" >> $GITHUB_OUTPUT
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 用 JSON 精确查资产是否存在（至少检查一个离线包）
+          has_asset=$(gh release view ${{ steps.get-version.outputs.version }} -R ${{ github.repository }} \
+            --json assets --jq '.assets[].name | select(test("1panel-.*-offline-linux-amd64\\.tar\\.gz"))' || true)
+          if [ -z "$has_asset" ]; then
+            echo "build=1" >> $GITHUB_OUTPUT
+          fi
 
       - name: Create Tag
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           sed -i "s@VERSION=v.*@VERSION=${{ steps.get-version.outputs.version }}@" install.sh
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add .
-          git commit -m "Release ${{ steps.get-version.outputs.version }}"
+          git commit -m "Release ${{ steps.get-version.outputs.version }}" || true
           git tag -a "${{ steps.get-version.outputs.version }}" -m "Release ${{ steps.get-version.outputs.version }}" || true
           git push origin "${{ steps.get-version.outputs.version }}" || true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create Release
         if: steps.check-release.outputs.create == 1
-        run: |
-          gh release create ${{ steps.get-version.outputs.version }} --notes "Release ${{ steps.get-version.outputs.version }}" -R ${{ github.repository }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create ${{ steps.get-version.outputs.version }} --notes "Release ${{ steps.get-version.outputs.version }}" -R ${{ github.repository }}
 
-      - name: Make Offine
+      - name: Make Offline
         if: steps.check-build.outputs.build == 1
+        env:
+          # 让 prepare.sh 从官方仓库拉资产，避免 404
+          APP_REPO: 1Panel-dev/1Panel
         run: |
           chmod +x prepare.sh
-          sudo ./prepare.sh --app_version ${{ steps.get-version.outputs.app_version }} --docker_version ${{ steps.get-version.outputs.docker_version }} --compose_version ${{ steps.get-version.outputs.compose_version }}
+          sudo APP_REPO="$APP_REPO" ./prepare.sh \
+            --app_version "${{ steps.get-version.outputs.app_version }}" \
+            --docker_version "${{ steps.get-version.outputs.docker_version }}" \
+            --compose_version "${{ steps.get-version.outputs.compose_version }}"
 
       - name: Upgrade Release
         if: steps.check-build.outputs.build == 1
-        run: |
-          gh release upload ${{ steps.get-version.outputs.version }} build/${{ steps.get-version.outputs.version }}/*.tar.gz -R ${{ github.repository }} --clobber
-          gh release upload ${{ steps.get-version.outputs.version }} build/${{ steps.get-version.outputs.version }}/checksums.txt -R ${{ github.repository }} --clobber
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 修正上传路径：与 prepare.sh 实际输出对齐（常见为 build/*.tar.gz）
+          shopt -s nullglob
+          files=(build/*.tar.gz)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No tar.gz under build/. Try fallback path build/${{ steps.get-version.outputs.version }}/"
+            files=(build/${{ steps.get-version.outputs.version }}/*.tar.gz)
+          fi
+          echo "Uploading files: ${files[*]}"
+          gh release upload ${{ steps.get-version.outputs.version }} "${files[@]}" -R ${{ github.repository }} --clobber
+
+          # checksums 也做双路径兜底
+          if [ -f "build/checksums.txt" ]; then
+            gh release upload ${{ steps.get-version.outputs.version }} build/checksums.txt -R ${{ github.repository }} --clobber
+          elif [ -f "build/${{ steps.get-version.outputs.version }}/checksums.txt" ]; then
+            gh release upload ${{ steps.get-version.outputs.version }} build/${{ steps.get-version.outputs.version }}/checksums.txt -R ${{ github.repository }} --clobber
+          else
+            echo "checksums.txt not found, skip."
+          fi
